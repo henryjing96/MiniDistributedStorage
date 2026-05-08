@@ -70,10 +70,15 @@ func Open(dsn string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// SQLite allows at most one writer at a time. Pin the *sql.DB to a
+	// single connection so concurrent goroutines serialize cleanly through
+	// it instead of racing each other into SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	for _, p := range []string{
 		"PRAGMA foreign_keys = ON",
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA synchronous = NORMAL",
+		"PRAGMA busy_timeout = 5000",
 	} {
 		if _, err := db.Exec(p); err != nil {
 			db.Close()
