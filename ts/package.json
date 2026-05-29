@@ -1,0 +1,23 @@
+{
+  "name": "minidss",
+  "version": "0.1.0",
+  "description": "Mini distributed storage — TypeScript MVP",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist coordinator.db* data data-stor*",
+    "coordinatord": "node dist/src/coordinator/main.js",
+    "storaged": "node dist/src/storage/main.js",
+    "dssctl": "node dist/src/client/main.js",
+    "test": "npm run build && node --test dist/test/chunk.test.js dist/test/e2e.test.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
