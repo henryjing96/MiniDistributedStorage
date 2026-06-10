@@ -1,4 +1,6 @@
+import { loadToken } from "../auth.js";
 import { parseAddr, parseFlags, pick } from "../config.js";
+import { Logger } from "../logger.js";
 import { MetaStore } from "../metastore.js";
 import { CoordinatorServer } from "./server.js";
 
@@ -20,6 +22,10 @@ async function main(): Promise<void> {
     "http://127.0.0.1:9982,http://127.0.0.1:9983,http://127.0.0.1:9984",
   );
   const replicas = Number(pick(flags, "replicas", "MINIDSS_REPLICAS", "1"));
+  const probeIntervalSec = Number(pick(flags, "probe-interval-sec", "MINIDSS_PROBE_INTERVAL_SEC", "5"));
+  const probeTimeoutMs = Number(pick(flags, "probe-timeout-ms", "MINIDSS_PROBE_TIMEOUT_MS", "1000"));
+  const tokenFile = pick(flags, "token-file", "MINIDSS_TOKEN_FILE", "");
+  const tokenInline = flags.get("token") ?? "";
 
   const nodes = splitTrim(nodesStr);
   if (nodes.length === 0) {
@@ -27,14 +33,31 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  const token = await loadToken({
+    file: tokenFile || undefined,
+    inline: tokenInline || undefined,
+    envName: "MINIDSS_TOKEN",
+  });
+
   const store = new MetaStore(dbPath);
-  const srv = new CoordinatorServer({ store, storageNodes: nodes, replicas });
+  const log = new Logger("coordinator");
+  const srv = new CoordinatorServer({
+    store,
+    storageNodes: nodes,
+    replicas,
+    token,
+    probeIntervalMs: probeIntervalSec * 1000,
+    probeTimeoutMs,
+    logger: log,
+  });
+  srv.start();
 
   const { host, port } = parseAddr(addr);
   const http = srv.createHttpServer();
 
-  const shutdown = () => {
-    console.log("shutting down...");
+  const shutdown = (): void => {
+    log.info("shutdown_start");
+    srv.stop();
     http.close(() => {
       store.close();
       process.exit(0);
@@ -45,9 +68,14 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 
   http.listen(port, host, () => {
-    console.log(
-      `coordinator listening on ${addr} | nodes=${JSON.stringify(nodes)} replicas=${replicas} db=${dbPath}`,
-    );
+    log.info("listening", {
+      addr,
+      nodes,
+      replicas,
+      db: dbPath,
+      auth_enabled: token !== "",
+      probe_interval_sec: probeIntervalSec,
+    });
   });
 }
 

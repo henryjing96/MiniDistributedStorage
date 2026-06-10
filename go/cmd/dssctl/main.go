@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"minidss/internal/auth"
 	"minidss/internal/chunk"
 	"minidss/internal/proto"
 )
@@ -21,6 +22,9 @@ func main() {
 	coord := flag.String("coordinator", envOr("MINIDSS_COORDINATOR", "http://127.0.0.1:9981"),
 		"coordinator URL")
 	blockSize := flag.Int("block-size", proto.DefaultBlockSize, "upload block size in bytes")
+	tokenFile := flag.String("token-file", envOr("MINIDSS_TOKEN_FILE", ""),
+		"path to file containing bearer token")
+	tokenInline := flag.String("token", "", "inline bearer token")
 	flag.Usage = usage
 	flag.Parse()
 	args := flag.Args()
@@ -29,13 +33,18 @@ func main() {
 		os.Exit(2)
 	}
 
+	token, err := auth.Load(*tokenFile, *tokenInline, "MINIDSS_TOKEN")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error: load token:", err)
+		os.Exit(1)
+	}
+
 	c := &Client{
-		Base: *coord,
-		HTTP: &http.Client{Timeout: 10 * time.Minute},
+		Base:      *coord,
+		HTTP:      &http.Client{Timeout: 10 * time.Minute, Transport: tokenTransport{token: token}},
 		BlockSize: *blockSize,
 	}
 
-	var err error
 	switch args[0] {
 	case "upload":
 		if len(args) < 2 {
@@ -75,8 +84,18 @@ func main() {
 	}
 }
 
+// tokenTransport wraps DefaultTransport to inject Authorization on every request.
+type tokenTransport struct{ token string }
+
+func (t tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.token != "" {
+		req.Header.Set(auth.HeaderName, auth.HeaderPrefix+t.token)
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: dssctl [-coordinator URL] [-block-size N] <command> [args]
+	fmt.Fprintln(os.Stderr, `usage: dssctl [-coordinator URL] [-block-size N] [-token-file PATH] <command> [args]
 
 commands:
   upload <localpath> [remotename]
@@ -85,7 +104,8 @@ commands:
   rm <remotename>
 
 env:
-  MINIDSS_COORDINATOR  override default coordinator URL`)
+  MINIDSS_COORDINATOR  override default coordinator URL
+  MINIDSS_TOKEN        bearer token (or MINIDSS_TOKEN_FILE)`)
 }
 
 func envOr(k, def string) string {

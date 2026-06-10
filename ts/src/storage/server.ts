@@ -2,27 +2,67 @@
 
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, rename, rm, stat } from "node:fs/promises";
+import { mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkAuth } from "../auth.js";
+import { Logger, withHttpLogging } from "../logger.js";
+import { Counter, Gauge, Registry } from "../metrics.js";
 import { isValidHash } from "../proto.js";
 
 export interface StorageOptions {
   dataDir: string;
   nodeId?: string;
-  logger?: (msg: string) => void;
+  token?: string;
+  logger?: Logger;
 }
+
+interface StorMetrics {
+  registry: Registry;
+  httpRequests: Counter;
+  httpDurationSum: Counter;
+  httpDurationCnt: Counter;
+  blocksTotal: Gauge;
+  bytesTotal: Gauge;
+}
+
+function newStorMetrics(): StorMetrics {
+  const r = new Registry();
+  return {
+    registry: r,
+    httpRequests: r.newCounter("minidss_http_requests_total", "HTTP requests served"),
+    httpDurationSum: r.newCounter(
+      "minidss_http_request_duration_ms_sum",
+      "Sum of HTTP request durations in ms",
+    ),
+    httpDurationCnt: r.newCounter(
+      "minidss_http_request_duration_ms_count",
+      "Count of HTTP requests measured",
+    ),
+    blocksTotal: r.newGauge("minidss_storage_blocks_total", "Number of blocks stored locally"),
+    bytesTotal: r.newGauge("minidss_storage_bytes_total", "Total bytes stored locally"),
+  };
+}
+
+const OPEN_PATHS: ReadonlySet<string> = new Set(["/healthz"]);
 
 export class StorageServer {
   private dataDir: string;
   private nodeId: string;
-  private log: (msg: string) => void;
+  private token: string;
+  private log: Logger;
+  private metrics: StorMetrics;
+  private lastScan = 0;
+  private blockCount = 0;
+  private byteCount = 0;
 
   constructor(opts: StorageOptions) {
     this.dataDir = opts.dataDir;
     this.nodeId = opts.nodeId ?? "";
-    this.log = opts.logger ?? ((m) => console.log(m));
+    this.token = opts.token ?? "";
+    this.log = opts.logger ?? new Logger("storage");
+    this.metrics = newStorMetrics();
   }
 
   async init(): Promise<void> {
@@ -34,20 +74,41 @@ export class StorageServer {
   }
 
   createHttpServer(): Server {
+    const wrapped = withHttpLogging(this.log, this.observeHTTP.bind(this), (req, res) =>
+      this.dispatch(req, res),
+    );
     return createServer((req, res) => {
-      this.handle(req, res).catch((err) => {
-        this.log(`unhandled: ${err}`);
+      wrapped(req, res).catch((err: unknown) => {
+        this.log.error("unhandled", { err: String(err) });
         if (!res.headersSent) res.writeHead(500);
         res.end("internal error");
       });
     });
   }
 
-  private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = req.url ?? "/";
+  private observeHTTP(
+    method: string,
+    _path: string,
+    status: number,
+    _bytes: number,
+    durMs: number,
+  ): void {
+    const s = String(status);
+    this.metrics.httpRequests.inc("method", method, "status", s);
+    this.metrics.httpDurationSum.add(durMs, "method", method);
+    this.metrics.httpDurationCnt.inc("method", method);
+  }
+
+  private async dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!checkAuth(req, res, this.token, OPEN_PATHS)) return;
+    const url = (req.url ?? "/").split("?")[0] ?? "/";
     if (url === "/healthz") {
       res.writeHead(200);
       res.end("ok\n");
+      return;
+    }
+    if (url === "/metrics") {
+      await this.serveMetrics(res);
       return;
     }
     if (!url.startsWith("/blocks/")) {
@@ -82,12 +143,52 @@ export class StorageServer {
     }
   }
 
-  /**
-   * Write a block to its content-addressed path, verifying the stream hashes
-   * to the path id. Idempotent: an existing block with matching content
-   * returns 200 without rewriting; a hash mismatch returns 400 and nothing
-   * is persisted.
-   */
+  private async serveMetrics(res: ServerResponse): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    if (now - this.lastScan > 5) {
+      await this.refreshDiskUsage();
+      this.lastScan = now;
+    }
+    this.metrics.blocksTotal.set(this.blockCount);
+    this.metrics.bytesTotal.set(this.byteCount);
+    res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4" });
+    res.end(this.metrics.registry.format());
+  }
+
+  private async refreshDiskUsage(): Promise<void> {
+    let blocks = 0;
+    let bytes = 0;
+    let prefixes: string[];
+    try {
+      prefixes = await readdir(this.dataDir);
+    } catch {
+      this.blockCount = 0;
+      this.byteCount = 0;
+      return;
+    }
+    for (const p of prefixes) {
+      let files: string[];
+      try {
+        files = await readdir(join(this.dataDir, p));
+      } catch {
+        continue;
+      }
+      for (const f of files) {
+        try {
+          const s = await stat(join(this.dataDir, p, f));
+          if (s.isFile()) {
+            blocks++;
+            bytes += s.size;
+          }
+        } catch {
+          /* skip */
+        }
+      }
+    }
+    this.blockCount = blocks;
+    this.byteCount = bytes;
+  }
+
   private async put(
     req: IncomingMessage,
     res: ServerResponse,
@@ -112,25 +213,21 @@ export class StorageServer {
       res.end("hash mismatch");
       return;
     }
-
     const exists = await fileExists(path);
     if (exists) {
       res.writeHead(200);
       res.end();
       return;
     }
-
     await mkdir(join(path, ".."), { recursive: true });
     const tmp = join(
       tmpdir(),
       `.minidss-${id}-${process.pid}-${Math.random().toString(36).slice(2)}`,
     );
-    const { writeFile } = await import("node:fs/promises");
     await writeFile(tmp, Buffer.concat(chunks));
     try {
       await rename(tmp, path);
     } catch {
-      // cross-device or race: fall back to copy then unlink
       const { copyFile } = await import("node:fs/promises");
       await copyFile(tmp, path);
       await rm(tmp, { force: true });
@@ -156,11 +253,8 @@ export class StorageServer {
   }
 
   private async head(res: ServerResponse, path: string): Promise<void> {
-    if (await fileExists(path)) {
-      res.writeHead(200);
-    } else {
-      res.writeHead(404);
-    }
+    if (await fileExists(path)) res.writeHead(200);
+    else res.writeHead(404);
     res.end();
   }
 

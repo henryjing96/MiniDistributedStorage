@@ -1,4 +1,5 @@
 import { basename } from "node:path";
+import { loadToken } from "../auth.js";
 import { parseFlags, pick } from "../config.js";
 import { DEFAULT_BLOCK_SIZE } from "../proto.js";
 import { Client } from "./client.js";
@@ -20,6 +21,13 @@ async function main(): Promise<void> {
   const flags = parseFlags(process.argv.slice(2));
   const coord = pick(flags, "coordinator", "MINIDSS_COORDINATOR", "http://127.0.0.1:9981");
   const blockSize = Number(flags.get("block-size") ?? DEFAULT_BLOCK_SIZE);
+  const tokenFile = pick(flags, "token-file", "MINIDSS_TOKEN_FILE", "");
+  const tokenInline = flags.get("token") ?? "";
+  const token = await loadToken({
+    file: tokenFile || undefined,
+    inline: tokenInline || undefined,
+    envName: "MINIDSS_TOKEN",
+  });
 
   // positional args = argv items that aren't flags or flag-values
   const positional = positionalArgs(process.argv.slice(2));
@@ -28,7 +36,7 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const client = new Client(coord, blockSize);
+  const client = new Client(coord, blockSize, token);
   const cmd = positional[0];
 
   switch (cmd) {
@@ -80,7 +88,7 @@ function fail(): never {
 
 function positionalArgs(argv: string[]): string[] {
   const out: string[] = [];
-  const valued = new Set(["coordinator", "block-size"]);
+  const valued = new Set(["coordinator", "block-size", "token", "token-file"]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a.startsWith("-")) {

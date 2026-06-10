@@ -12,7 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	"minidss/internal/auth"
 	"minidss/internal/coordinator"
+	"minidss/internal/logger"
 	"minidss/internal/metastore"
 )
 
@@ -24,11 +26,23 @@ func main() {
 		"comma-separated storage node base URLs")
 	replicas := flag.Int("replicas", envOrInt("MINIDSS_REPLICAS", 1),
 		"replicas per block (1..N)")
+	tokenFile := flag.String("token-file", envOr("MINIDSS_TOKEN_FILE", ""),
+		"path to file containing bearer token (preferred)")
+	tokenInline := flag.String("token", "", "inline bearer token (use --token-file in prod)")
+	probeIntervalSec := flag.Int("probe-interval-sec", envOrInt("MINIDSS_PROBE_INTERVAL_SEC", 5),
+		"storage node health probe interval seconds (0=disabled)")
+	probeTimeoutMs := flag.Int("probe-timeout-ms", envOrInt("MINIDSS_PROBE_TIMEOUT_MS", 1000),
+		"storage node health probe HTTP timeout milliseconds")
 	flag.Parse()
 
 	nodeList := splitTrim(*nodes)
 	if len(nodeList) == 0 {
 		log.Fatal("no storage nodes configured")
+	}
+
+	token, err := auth.Load(*tokenFile, *tokenInline, "MINIDSS_TOKEN")
+	if err != nil {
+		log.Fatalf("load token: %v", err)
 	}
 
 	store, err := metastore.Open(*dbPath)
@@ -37,13 +51,19 @@ func main() {
 	}
 	defer store.Close()
 
+	lg := logger.New("coordinator")
 	srv, err := coordinator.New(store, coordinator.Config{
-		StorageNodes: nodeList,
-		Replicas:     *replicas,
-	}, log.Default())
+		StorageNodes:  nodeList,
+		Replicas:      *replicas,
+		Token:         token,
+		ProbeInterval: time.Duration(*probeIntervalSec) * time.Second,
+		ProbeTimeout:  time.Duration(*probeTimeoutMs) * time.Millisecond,
+	}, lg)
 	if err != nil {
 		log.Fatalf("coordinator: %v", err)
 	}
+	srv.Start()
+	defer srv.Stop()
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
@@ -52,8 +72,11 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("coordinator listening on %s | nodes=%v replicas=%d db=%s",
-			*addr, nodeList, *replicas, *dbPath)
+		lg.Info("listening", map[string]any{
+			"addr": *addr, "nodes": nodeList, "replicas": *replicas,
+			"db": *dbPath, "auth_enabled": token != "",
+			"probe_interval_sec": *probeIntervalSec,
+		})
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("listen: %v", err)
 		}
@@ -62,7 +85,7 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	log.Println("shutting down...")
+	lg.Info("shutdown_start", nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)

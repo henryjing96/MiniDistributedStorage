@@ -6,30 +6,67 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"minidss/internal/auth"
+	"minidss/internal/logger"
+	"minidss/internal/metrics"
 )
 
 var hashRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-type Server struct {
+type Config struct {
 	DataDir string
 	NodeID  string
-	logger  *log.Logger
+	Token   string
 }
 
-func New(dataDir, nodeID string, logger *log.Logger) (*Server, error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+type Server struct {
+	cfg     Config
+	log     *logger.Logger
+	metrics *storageMetrics
+	// cached counters refreshed lazily when /metrics is scraped
+	blockCount atomic.Int64
+	byteCount  atomic.Int64
+	lastScan   atomic.Int64 // unix seconds
+}
+
+type storageMetrics struct {
+	registry        *metrics.Registry
+	httpRequests    *metrics.Counter
+	httpDurationSum *metrics.Counter
+	httpDurationCnt *metrics.Counter
+	blocksTotal     *metrics.Gauge
+	bytesTotal      *metrics.Gauge
+}
+
+func newStorageMetrics() *storageMetrics {
+	r := metrics.New()
+	return &storageMetrics{
+		registry:        r,
+		httpRequests:    r.NewCounter("minidss_http_requests_total", "HTTP requests served"),
+		httpDurationSum: r.NewCounter("minidss_http_request_duration_ms_sum", "Sum of HTTP request durations in ms"),
+		httpDurationCnt: r.NewCounter("minidss_http_request_duration_ms_count", "Count of HTTP requests measured"),
+		blocksTotal:     r.NewGauge("minidss_storage_blocks_total", "Number of blocks stored locally"),
+		bytesTotal:      r.NewGauge("minidss_storage_bytes_total", "Total bytes stored locally"),
+	}
+}
+
+func New(cfg Config, lg *logger.Logger) (*Server, error) {
+	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
 	}
-	if logger == nil {
-		logger = log.Default()
+	if lg == nil {
+		lg = logger.New("storage")
 	}
-	return &Server{DataDir: dataDir, NodeID: nodeID, logger: logger}, nil
+	return &Server{cfg: cfg, log: lg, metrics: newStorageMetrics()}, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -38,12 +75,49 @@ func (s *Server) Handler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/blocks/", s.handleBlock)
-	return mux
+	open := map[string]bool{"/healthz": true}
+	withAuth := auth.Middleware(s.cfg.Token, open, mux)
+	return logger.HTTPMiddleware(s.log, s.observeHTTP, withAuth)
+}
+
+func (s *Server) observeHTTP(method, _ string, status int, _ int, duration time.Duration) {
+	statusStr := strconv.Itoa(status)
+	s.metrics.httpRequests.Inc("method", method, "status", statusStr)
+	s.metrics.httpDurationSum.Add(uint64(duration.Milliseconds()), "method", method)
+	s.metrics.httpDurationCnt.Inc("method", method)
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	// refresh disk usage at most once every 5s (scanning is O(blocks))
+	now := time.Now().Unix()
+	if now-s.lastScan.Load() > 5 {
+		s.refreshDiskUsage()
+		s.lastScan.Store(now)
+	}
+	s.metrics.blocksTotal.Set(s.blockCount.Load())
+	s.metrics.bytesTotal.Set(s.byteCount.Load())
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	s.metrics.registry.WriteText(w)
+}
+
+func (s *Server) refreshDiskUsage() {
+	var blocks, bytes int64
+	_ = filepath.Walk(s.cfg.DataDir, func(_ string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		blocks++
+		bytes += info.Size()
+		return nil
+	})
+	s.blockCount.Store(blocks)
+	s.byteCount.Store(bytes)
 }
 
 func (s *Server) blockPath(id string) string {
-	return filepath.Join(s.DataDir, id[:2], id[2:])
+	return filepath.Join(s.cfg.DataDir, id[:2], id[2:])
 }
 
 func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
@@ -102,7 +176,6 @@ func (s *Server) handleBlock(w http.ResponseWriter, r *http.Request) {
 // returns 400.
 func (s *Server) put(path, id string, body io.Reader) (int, error) {
 	if _, err := os.Stat(path); err == nil {
-		// already on disk — drain body, verify hash matches the path id
 		h := sha256.New()
 		if _, err := io.Copy(h, body); err != nil {
 			return http.StatusBadRequest, err
@@ -149,3 +222,4 @@ func (s *Server) put(path, id string, body io.Reader) (int, error) {
 	cleaned = true
 	return http.StatusCreated, nil
 }
+

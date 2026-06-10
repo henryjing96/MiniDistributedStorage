@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -17,23 +16,55 @@ import (
 	"strings"
 	"time"
 
+	"minidss/internal/auth"
+	"minidss/internal/logger"
 	"minidss/internal/metastore"
+	"minidss/internal/metrics"
 	"minidss/internal/proto"
 )
 
 type Config struct {
-	StorageNodes []string // base URLs, e.g. http://storage1:9982
-	Replicas     int      // 1..len(StorageNodes)
+	StorageNodes  []string // base URLs, e.g. http://storage1:9982
+	Replicas      int      // 1..len(StorageNodes)
+	Token         string   // bearer token (empty = auth disabled)
+	ProbeInterval time.Duration
+	ProbeTimeout  time.Duration
 }
 
 type Server struct {
-	store  *metastore.Store
-	cfg    Config
-	client *http.Client
-	logger *log.Logger
+	store   *metastore.Store
+	cfg     Config
+	client  *http.Client
+	log     *logger.Logger
+	metrics *Metrics
+	probe   *nodeProbe
 }
 
-func New(store *metastore.Store, cfg Config, logger *log.Logger) (*Server, error) {
+// Metrics groups the metric handles for coordinator-side observation.
+type Metrics struct {
+	registry        *metrics.Registry
+	httpRequests    *metrics.Counter
+	httpDurationSum *metrics.Counter // milliseconds
+	httpDurationCnt *metrics.Counter
+	replicaWrites   *metrics.Counter
+	nodeUp          *metrics.Gauge
+	filesTotal      *metrics.Gauge
+}
+
+func newMetrics() *Metrics {
+	r := metrics.New()
+	return &Metrics{
+		registry:        r,
+		httpRequests:    r.NewCounter("minidss_http_requests_total", "HTTP requests served"),
+		httpDurationSum: r.NewCounter("minidss_http_request_duration_ms_sum", "Sum of HTTP request durations in ms"),
+		httpDurationCnt: r.NewCounter("minidss_http_request_duration_ms_count", "Count of HTTP requests measured"),
+		replicaWrites:   r.NewCounter("minidss_replica_writes_total", "Replica fan-out write outcomes"),
+		nodeUp:          r.NewGauge("minidss_storage_node_up", "Storage node liveness (1=up, 0=down)"),
+		filesTotal:      r.NewGauge("minidss_files_total", "Files registered in metadata"),
+	}
+}
+
+func New(store *metastore.Store, cfg Config, lg *logger.Logger) (*Server, error) {
 	if len(cfg.StorageNodes) == 0 {
 		return nil, errors.New("no storage nodes configured")
 	}
@@ -43,21 +74,43 @@ func New(store *metastore.Store, cfg Config, logger *log.Logger) (*Server, error
 	if cfg.Replicas > len(cfg.StorageNodes) {
 		return nil, fmt.Errorf("replicas %d > storage nodes %d", cfg.Replicas, len(cfg.StorageNodes))
 	}
-	if logger == nil {
-		logger = log.Default()
+	if lg == nil {
+		lg = logger.New("coordinator")
 	}
-	return &Server{
-		store:  store,
-		cfg:    cfg,
-		client: &http.Client{Timeout: 60 * time.Second},
-		logger: logger,
-	}, nil
+	s := &Server{
+		store:   store,
+		cfg:     cfg,
+		client:  &http.Client{Timeout: 60 * time.Second},
+		log:     lg,
+		metrics: newMetrics(),
+	}
+	s.probe = newNodeProbe(cfg.StorageNodes, cfg.ProbeInterval, cfg.ProbeTimeout, s.onNodeChange)
+	for _, n := range cfg.StorageNodes {
+		s.metrics.nodeUp.Set(1, "node", n) // optimistic
+	}
+	return s, nil
 }
 
-// pickNodes returns the deterministic ordered list of storage nodes for a
-// given block hash, using rendezvous (HRW) hashing. The first cfg.Replicas
-// entries are the canonical replicas; later entries are fall-backs for
-// reads when a primary is unreachable.
+// Start launches background workers (probe). Stop releases them.
+func (s *Server) Start() {
+	s.probe.start()
+}
+
+func (s *Server) Stop() {
+	s.probe.stop()
+}
+
+func (s *Server) onNodeChange(node string, up bool) {
+	v := int64(0)
+	if up {
+		v = 1
+	}
+	s.metrics.nodeUp.Set(v, "node", node)
+	s.log.Info("storage_node_health", map[string]any{"node": node, "up": up})
+}
+
+// pickNodes is HRW ordering across ALL configured nodes. Health-aware
+// selection happens at call sites.
 func (s *Server) pickNodes(blockSHA string) []string {
 	type sc struct {
 		node  string
@@ -80,14 +133,93 @@ func (s *Server) pickNodes(blockSHA string) []string {
 	return out
 }
 
+// pickUpNodes returns up to `replicas` healthy nodes in HRW order. If
+// fewer than `replicas` are up, returns whatever's available (caller
+// decides whether to fail). Down nodes are appended at the end so the
+// caller can still try them as best-effort.
+func (s *Server) pickUpNodes(blockSHA string, replicas int) (chosen, fallback []string) {
+	ranked := s.pickNodes(blockSHA)
+	for _, n := range ranked {
+		if s.probe.isUp(n) {
+			if len(chosen) < replicas {
+				chosen = append(chosen, n)
+			}
+		} else {
+			fallback = append(fallback, n)
+		}
+	}
+	// if not enough healthy nodes, top up from fallback
+	for len(chosen) < replicas && len(fallback) > 0 {
+		chosen = append(chosen, fallback[0])
+		fallback = fallback[1:]
+	}
+	return
+}
+
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
+	mux.HandleFunc("/metrics", s.handleMetrics)
 	mux.HandleFunc("/v1/files", s.handleFiles)
 	mux.HandleFunc("/v1/files/", s.handleFile)
-	return mux
+
+	open := map[string]bool{"/healthz": true}
+	withAuth := auth.Middleware(s.cfg.Token, open, mux)
+	return logger.HTTPMiddleware(s.log, s.observeHTTP, withAuth)
+}
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if files, err := s.store.ListFiles(); err == nil {
+		var complete, pending int64
+		for _, f := range files {
+			if f.State == "complete" {
+				complete++
+			} else {
+				pending++
+			}
+		}
+		s.metrics.filesTotal.Set(complete, "state", "complete")
+		s.metrics.filesTotal.Set(pending, "state", "pending")
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	s.metrics.registry.WriteText(w)
+}
+
+func (s *Server) observeHTTP(method, path string, status int, _ int, duration time.Duration) {
+	route := classifyRoute(path)
+	statusStr := strconv.Itoa(status)
+	s.metrics.httpRequests.Inc("method", method, "route", route, "status", statusStr)
+	s.metrics.httpDurationSum.Add(uint64(duration.Milliseconds()), "method", method, "route", route)
+	s.metrics.httpDurationCnt.Inc("method", method, "route", route)
+}
+
+// classifyRoute maps a request path to a low-cardinality route label.
+func classifyRoute(p string) string {
+	switch {
+	case p == "/healthz":
+		return "/healthz"
+	case p == "/metrics":
+		return "/metrics"
+	case p == "/v1/files":
+		return "/v1/files"
+	case strings.HasPrefix(p, "/v1/files/"):
+		rest := strings.TrimPrefix(p, "/v1/files/")
+		parts := strings.SplitN(rest, "/", 3)
+		if len(parts) == 1 {
+			return "/v1/files/:name"
+		}
+		if len(parts) >= 2 {
+			switch parts[1] {
+			case "init", "commit", "manifest":
+				return "/v1/files/:name/" + parts[1]
+			case "blocks":
+				return "/v1/files/:name/blocks/:idx"
+			}
+		}
+	}
+	return "other"
 }
 
 func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
@@ -110,12 +242,6 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-// Routes (under /v1/files/):
-//   {name}                 GET (download stream), DELETE
-//   {name}/init            POST  (resumable manifest registration)
-//   {name}/blocks/{idx}    PUT   (upload), GET (download single block)
-//   {name}/commit          POST
-//   {name}/manifest        GET
 func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/files/")
 	if rest == "" {
@@ -219,11 +345,13 @@ func (s *Server) initUpload(w http.ResponseWriter, r *http.Request, name string)
 			http.Error(w, "invalid block info", 400)
 			return
 		}
-		ranked := s.pickNodes(b.SHA256)
-		replicas := ranked[:s.cfg.Replicas]
+		// Pick replicas based on current node health. The placement is
+		// recorded in metadata so reads can find them later. Down nodes
+		// only get used if there aren't enough up ones.
+		chosen, _ := s.pickUpNodes(b.SHA256, s.cfg.Replicas)
 		rows = append(rows, metastore.BlockRow{
 			Idx: b.Index, SHA256: b.SHA256, Size: b.Size,
-			StorageNodes: replicas,
+			StorageNodes: chosen,
 		})
 	}
 	f, err := s.store.CreateOrResume(name, m.Size, m.SHA256, m.BlockSize, rows)
@@ -263,9 +391,6 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, name string
 		return
 	}
 
-	// Buffer the block so we can fan out to replicas. Block size is bounded
-	// by the configured manifest block size (default 4 MiB), so this is
-	// memory-safe for normal workloads.
 	body, err := io.ReadAll(io.LimitReader(r.Body, int64(b.Size)+1))
 	if err != nil {
 		http.Error(w, "read body: "+err.Error(), 400)
@@ -286,7 +411,9 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, name string
 		return
 	}
 	if successes < len(b.StorageNodes) {
-		s.logger.Printf("block %s: only %d/%d replicas accepted", b.SHA256, successes, len(b.StorageNodes))
+		s.log.Warn("partial_replica_write", map[string]any{
+			"block": b.SHA256, "ok": successes, "want": len(b.StorageNodes),
+		})
 	}
 
 	if err := s.store.MarkUploaded(f.ID, idx); err != nil {
@@ -298,25 +425,36 @@ func (s *Server) uploadBlock(w http.ResponseWriter, r *http.Request, name string
 
 func (s *Server) fanoutPut(ctx context.Context, nodes []string, blockSHA string, body []byte) (successes int, lastErr error) {
 	for _, node := range nodes {
+		// Fast-fail nodes that the probe knows are down.
+		if !s.probe.isUp(node) {
+			s.metrics.replicaWrites.Inc("outcome", "skipped_down")
+			lastErr = fmt.Errorf("%s: down (skipped)", node)
+			continue
+		}
 		u := node + "/blocks/" + blockSHA
 		req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, bytes.NewReader(body))
 		if err != nil {
 			lastErr = err
+			s.metrics.replicaWrites.Inc("outcome", "failure")
 			continue
 		}
 		req.ContentLength = int64(len(body))
 		req.Header.Set("Content-Type", "application/octet-stream")
+		auth.Apply(req, s.cfg.Token)
 		resp, err := s.client.Do(req)
 		if err != nil {
 			lastErr = err
+			s.metrics.replicaWrites.Inc("outcome", "failure")
 			continue
 		}
 		drainAndClose(resp)
 		if resp.StatusCode/100 != 2 {
 			lastErr = fmt.Errorf("%s: %s", node, resp.Status)
+			s.metrics.replicaWrites.Inc("outcome", "failure")
 			continue
 		}
 		successes++
+		s.metrics.replicaWrites.Inc("outcome", "success")
 	}
 	return
 }
@@ -333,22 +471,30 @@ func (s *Server) downloadBlock(w http.ResponseWriter, r *http.Request, name stri
 		return
 	}
 	if err := s.streamBlock(r.Context(), b, w); err != nil {
-		// best-effort: header may already be flushed
-		s.logger.Printf("download block %s idx %d: %v", b.SHA256, b.Idx, err)
+		s.log.Warn("download_block", map[string]any{"block": b.SHA256, "idx": b.Idx, "err": err.Error()})
 	}
 }
 
 func (s *Server) streamBlock(ctx context.Context, b *metastore.BlockRow, w io.Writer) error {
-	// Try replicas in order, then fall through to non-replica nodes if
-	// configured (defense in depth — useful if topology shifted).
-	tried := make(map[string]bool)
-	candidates := append([]string(nil), b.StorageNodes...)
+	// Build a candidate list: known replicas first (prefer up), then fall
+	// back to any other node (defense in depth if topology shifted).
+	var up, down []string
+	for _, n := range b.StorageNodes {
+		if s.probe.isUp(n) {
+			up = append(up, n)
+		} else {
+			down = append(down, n)
+		}
+	}
+	candidates := append(append([]string{}, up...), down...)
 	for _, n := range s.pickNodes(b.SHA256) {
 		if !contains(candidates, n) {
 			candidates = append(candidates, n)
 		}
 	}
+
 	var lastErr error
+	tried := map[string]bool{}
 	for _, node := range candidates {
 		if tried[node] {
 			continue
@@ -359,6 +505,7 @@ func (s *Server) streamBlock(ctx context.Context, b *metastore.BlockRow, w io.Wr
 			lastErr = err
 			continue
 		}
+		auth.Apply(req, s.cfg.Token)
 		resp, err := s.client.Do(req)
 		if err != nil {
 			lastErr = err
@@ -440,7 +587,7 @@ func (s *Server) download(w http.ResponseWriter, r *http.Request, name string) {
 	for i := range blocks {
 		b := &blocks[i]
 		if err := s.streamBlock(r.Context(), b, w); err != nil {
-			s.logger.Printf("download %s: block %d: %v", name, b.Idx, err)
+			s.log.Warn("download_stream", map[string]any{"file": name, "idx": b.Idx, "err": err.Error()})
 			return
 		}
 	}
@@ -458,6 +605,7 @@ func (s *Server) delete(w http.ResponseWriter, r *http.Request, name string) {
 			for _, node := range b.StorageNodes {
 				req, _ := http.NewRequestWithContext(r.Context(),
 					http.MethodDelete, node+"/blocks/"+b.SHA256, nil)
+				auth.Apply(req, s.cfg.Token)
 				resp, err := s.client.Do(req)
 				if err == nil {
 					drainAndClose(resp)
