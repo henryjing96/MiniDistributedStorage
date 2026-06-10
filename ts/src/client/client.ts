@@ -2,6 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { open, writeFile } from "node:fs/promises";
+import { bearerHeader } from "../auth.js";
 import { buildManifest } from "../chunk.js";
 import {
   DEFAULT_BLOCK_SIZE,
@@ -11,10 +12,21 @@ import {
 } from "../proto.js";
 
 export class Client {
+  private auth: string | undefined;
+
   constructor(
     private base: string,
     private blockSize: number = DEFAULT_BLOCK_SIZE,
-  ) {}
+    token = "",
+  ) {
+    this.auth = bearerHeader(token);
+  }
+
+  private headers(extra?: Record<string, string>): Record<string, string> {
+    const h: Record<string, string> = { ...(extra ?? {}) };
+    if (this.auth) h["Authorization"] = this.auth;
+    return h;
+  }
 
   private url(path: string): string {
     return this.base + path;
@@ -25,7 +37,7 @@ export class Client {
 
     const initRes = await fetch(this.url(`/v1/files/${encodeURIComponent(remoteName)}/init`), {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: this.headers({ "Content-Type": "application/json" }),
       body: JSON.stringify(manifest),
     });
     if (Math.floor(initRes.status / 100) !== 2) {
@@ -57,7 +69,7 @@ export class Client {
 
     const commitRes = await fetch(
       this.url(`/v1/files/${encodeURIComponent(remoteName)}/commit`),
-      { method: "POST" },
+      { method: "POST", headers: this.headers() },
     );
     if (Math.floor(commitRes.status / 100) !== 2) {
       throw new Error(`commit: ${commitRes.status}: ${await commitRes.text()}`);
@@ -71,7 +83,7 @@ export class Client {
       this.url(`/v1/files/${encodeURIComponent(remoteName)}/blocks/${idx}`),
       {
         method: "PUT",
-        headers: { "Content-Type": "application/octet-stream" },
+        headers: this.headers({ "Content-Type": "application/octet-stream" }),
         body: buf,
       },
     );
@@ -81,7 +93,9 @@ export class Client {
   }
 
   async download(remoteName: string, localPath: string): Promise<number> {
-    const r = await fetch(this.url(`/v1/files/${encodeURIComponent(remoteName)}`));
+    const r = await fetch(this.url(`/v1/files/${encodeURIComponent(remoteName)}`), {
+      headers: this.headers(),
+    });
     if (Math.floor(r.status / 100) !== 2) {
       throw new Error(`get: ${r.status}: ${await r.text()}`);
     }
@@ -90,9 +104,10 @@ export class Client {
     return buf.length;
   }
 
-  /** Download into a buffer (used by tests). */
   async downloadBuffer(remoteName: string): Promise<Buffer> {
-    const r = await fetch(this.url(`/v1/files/${encodeURIComponent(remoteName)}`));
+    const r = await fetch(this.url(`/v1/files/${encodeURIComponent(remoteName)}`), {
+      headers: this.headers(),
+    });
     if (Math.floor(r.status / 100) !== 2) {
       throw new Error(`get: ${r.status}: ${await r.text()}`);
     }
@@ -100,7 +115,7 @@ export class Client {
   }
 
   async list(): Promise<FileEntry[]> {
-    const r = await fetch(this.url(`/v1/files`));
+    const r = await fetch(this.url(`/v1/files`), { headers: this.headers() });
     if (Math.floor(r.status / 100) !== 2) throw new Error(`ls: ${r.status}`);
     return (await r.json()) as FileEntry[];
   }
@@ -108,6 +123,7 @@ export class Client {
   async remove(remoteName: string): Promise<void> {
     const r = await fetch(this.url(`/v1/files/${encodeURIComponent(remoteName)}`), {
       method: "DELETE",
+      headers: this.headers(),
     });
     if (Math.floor(r.status / 100) !== 2) {
       throw new Error(`delete: ${r.status}: ${await r.text()}`);

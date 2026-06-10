@@ -138,6 +138,57 @@ scenario2() {
   pass "ls/rm work across TS-client <-> Go-coordinator"
 }
 
+# ----------------------------------------------------------------------------
+# Scenario 3: shared token across all components, mixed Go/TS topology
+# ----------------------------------------------------------------------------
+scenario3() {
+  log "Scenario 3: TS client -> Go coordinator -> TS storage, with shared token"
+  local d="$WORK/s3"; mkdir -p "$d"
+  local TOKEN="iop-secret-token-xyz789"
+
+  MINIDSS_TOKEN="$TOKEN" start "$d/st1.log" $TS_STORAGE --addr :21122 --data "$d/stor1" --id t1
+  MINIDSS_TOKEN="$TOKEN" start "$d/st2.log" $TS_STORAGE --addr :21123 --data "$d/stor2" --id t2
+  MINIDSS_TOKEN="$TOKEN" start "$d/st3.log" $TS_STORAGE --addr :21124 --data "$d/stor3" --id t3
+  wait_health http://127.0.0.1:21122 || fail "TS storage 1 did not come up"
+  wait_health http://127.0.0.1:21123 || fail "TS storage 2 did not come up"
+  wait_health http://127.0.0.1:21124 || fail "TS storage 3 did not come up"
+
+  MINIDSS_TOKEN="$TOKEN" start "$d/coord.log" "$WORK/go-coordinatord" -addr :21121 -db "$d/coord.db" \
+    -nodes 'http://127.0.0.1:21122,http://127.0.0.1:21123,http://127.0.0.1:21124' \
+    -replicas 2
+  wait_health http://127.0.0.1:21121 || fail "Go coordinator did not come up"
+
+  # Step A: client WITHOUT the token must be rejected -> 401
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:21121/v1/files")
+  [ "$code" = "401" ] || fail "anon request expected 401, got $code"
+  pass "anonymous request rejected with 401"
+
+  # Step B: client WITH the token works end to end
+  local src="$d/src.bin" out="$d/out.bin"
+  head -c $((6*1024*1024+99)) /dev/urandom > "$src"
+  local want; want=$(sha256sum "$src" | awk '{print $1}')
+
+  MINIDSS_COORDINATOR=http://127.0.0.1:21121 MINIDSS_TOKEN="$TOKEN" $TS_CLIENT \
+    --block-size 1048576 upload "$src" interop3.bin >/dev/null
+  MINIDSS_COORDINATOR=http://127.0.0.1:21121 MINIDSS_TOKEN="$TOKEN" $TS_CLIENT \
+    download interop3.bin "$out" >/dev/null
+  local got; got=$(sha256sum "$out" | awk '{print $1}')
+  [ "$want" = "$got" ] || fail "scenario 3 sha mismatch ($want != $got)"
+  pass "TS-client+token <-> Go-coord+token <-> TS-storage+token round-trip"
+
+  # Step C: storage node also enforces — direct PUT without token -> 401
+  local fake; fake=$(printf 'a%.0s' $(seq 1 64))
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data 'x' \
+    "http://127.0.0.1:21122/blocks/$fake")
+  [ "$code" = "401" ] || fail "direct storage anon request expected 401, got $code"
+  pass "storage node rejects anonymous request with 401"
+
+  MINIDSS_COORDINATOR=http://127.0.0.1:21121 MINIDSS_TOKEN="$TOKEN" $TS_CLIENT \
+    rm interop3.bin >/dev/null
+}
+
 scenario1
 scenario2
+scenario3
 log "all interop scenarios passed"

@@ -2,12 +2,15 @@
 
 import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { bearerHeader, checkAuth } from "../auth.js";
+import { Logger, withHttpLogging } from "../logger.js";
 import {
   ConflictError,
   MetaStore,
   NotFoundError,
   type BlockRow,
 } from "../metastore.js";
+import { Counter, Gauge, Registry } from "../metrics.js";
 import {
   HASH_HEX_LEN,
   isValidName,
@@ -16,19 +19,60 @@ import {
   type InitResponse,
   type Manifest,
 } from "../proto.js";
+import { NodeProbe } from "./probe.js";
 
 export interface CoordinatorOptions {
   store: MetaStore;
   storageNodes: string[];
   replicas: number;
-  logger?: (msg: string) => void;
+  token?: string;
+  probeIntervalMs?: number;
+  probeTimeoutMs?: number;
+  logger?: Logger;
 }
+
+interface CoordMetrics {
+  registry: Registry;
+  httpRequests: Counter;
+  httpDurationSum: Counter;
+  httpDurationCnt: Counter;
+  replicaWrites: Counter;
+  nodeUp: Gauge;
+  filesTotal: Gauge;
+}
+
+function newCoordMetrics(): CoordMetrics {
+  const r = new Registry();
+  return {
+    registry: r,
+    httpRequests: r.newCounter("minidss_http_requests_total", "HTTP requests served"),
+    httpDurationSum: r.newCounter(
+      "minidss_http_request_duration_ms_sum",
+      "Sum of HTTP request durations in ms",
+    ),
+    httpDurationCnt: r.newCounter(
+      "minidss_http_request_duration_ms_count",
+      "Count of HTTP requests measured",
+    ),
+    replicaWrites: r.newCounter(
+      "minidss_replica_writes_total",
+      "Replica fan-out write outcomes",
+    ),
+    nodeUp: r.newGauge("minidss_storage_node_up", "Storage node liveness (1=up, 0=down)"),
+    filesTotal: r.newGauge("minidss_files_total", "Files registered in metadata"),
+  };
+}
+
+const OPEN_PATHS: ReadonlySet<string> = new Set(["/healthz"]);
 
 export class CoordinatorServer {
   private store: MetaStore;
   private nodes: string[];
   private replicas: number;
-  private log: (msg: string) => void;
+  private token: string;
+  private log: Logger;
+  private metrics: CoordMetrics;
+  private probe: NodeProbe;
 
   constructor(opts: CoordinatorOptions) {
     if (opts.storageNodes.length === 0) {
@@ -42,14 +86,30 @@ export class CoordinatorServer {
     }
     this.store = opts.store;
     this.nodes = opts.storageNodes;
-    this.log = opts.logger ?? ((m) => console.log(m));
+    this.token = opts.token ?? "";
+    this.log = opts.logger ?? new Logger("coordinator");
+    this.metrics = newCoordMetrics();
+    for (const n of this.nodes) this.metrics.nodeUp.set(1, "node", n);
+
+    this.probe = new NodeProbe({
+      nodes: this.nodes,
+      intervalMs: opts.probeIntervalMs ?? 0,
+      timeoutMs: opts.probeTimeoutMs ?? 1000,
+      onChange: (node, up) => {
+        this.metrics.nodeUp.set(up ? 1 : 0, "node", node);
+        this.log.info("storage_node_health", { node, up });
+      },
+    });
   }
 
-  /**
-   * Deterministic ordered node list for a block hash via rendezvous (HRW)
-   * hashing. The first `replicas` entries are the canonical replicas; the
-   * rest are read fall-backs.
-   */
+  start(): void {
+    this.probe.start();
+  }
+  stop(): void {
+    this.probe.stop();
+  }
+
+  /** Pure HRW ordering across all configured nodes. */
   pickNodes(blockSha: string): string[] {
     const scored = this.nodes.map((node) => {
       const sum = createHash("sha256")
@@ -57,7 +117,6 @@ export class CoordinatorServer {
         .update(Buffer.from([0]))
         .update(node)
         .digest();
-      // top 8 bytes as an unsigned score
       const score = sum.readBigUInt64BE(0);
       return { node, score };
     });
@@ -65,23 +124,49 @@ export class CoordinatorServer {
     return scored.map((s) => s.node);
   }
 
+  /** HRW order, preferring healthy nodes; fills from unhealthy as needed. */
+  private pickUpNodes(blockSha: string): { chosen: string[]; fallback: string[] } {
+    const ranked = this.pickNodes(blockSha);
+    const chosen: string[] = [];
+    const fallback: string[] = [];
+    for (const n of ranked) {
+      if (this.probe.isUp(n)) {
+        if (chosen.length < this.replicas) chosen.push(n);
+      } else {
+        fallback.push(n);
+      }
+    }
+    while (chosen.length < this.replicas && fallback.length > 0) {
+      chosen.push(fallback.shift()!);
+    }
+    return { chosen, fallback };
+  }
+
   createHttpServer(): Server {
+    const wrapped = withHttpLogging(this.log, this.observeHTTP.bind(this), (req, res) =>
+      this.dispatch(req, res),
+    );
     return createServer((req, res) => {
-      this.route(req, res).catch((err) => {
-        this.log(`unhandled: ${err}`);
+      wrapped(req, res).catch((err: unknown) => {
+        this.log.error("unhandled", { err: String(err) });
         if (!res.headersSent) res.writeHead(500);
         res.end("internal error");
       });
     });
   }
 
-  private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  private async dispatch(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!checkAuth(req, res, this.token, OPEN_PATHS)) return;
     const url = new URL(req.url ?? "/", "http://internal");
     const path = url.pathname;
 
     if (path === "/healthz") {
       res.writeHead(200);
       res.end("ok\n");
+      return;
+    }
+    if (path === "/metrics") {
+      this.serveMetrics(res);
       return;
     }
     if (path === "/v1/files") {
@@ -95,6 +180,38 @@ export class CoordinatorServer {
     }
     res.writeHead(404);
     res.end("not found");
+  }
+
+  private serveMetrics(res: ServerResponse): void {
+    try {
+      const files = this.store.listFiles();
+      let complete = 0;
+      let pending = 0;
+      for (const f of files) {
+        if (f.state === "complete") complete++;
+        else pending++;
+      }
+      this.metrics.filesTotal.set(complete, "state", "complete");
+      this.metrics.filesTotal.set(pending, "state", "pending");
+    } catch {
+      /* ignore */
+    }
+    res.writeHead(200, { "Content-Type": "text/plain; version=0.0.4" });
+    res.end(this.metrics.registry.format());
+  }
+
+  private observeHTTP(
+    method: string,
+    path: string,
+    status: number,
+    _bytes: number,
+    durMs: number,
+  ): void {
+    const route = classifyRoute(path);
+    const s = String(status);
+    this.metrics.httpRequests.inc("method", method, "route", route, "status", s);
+    this.metrics.httpDurationSum.add(durMs, "method", method, "route", route);
+    this.metrics.httpDurationCnt.inc("method", method, "route", route);
   }
 
   private async routeFile(
@@ -207,8 +324,8 @@ export class CoordinatorServer {
         res.end("invalid block info");
         return;
       }
-      const replicas = this.pickNodes(b.sha256).slice(0, this.replicas);
-      rows.push({ idx: b.index, sha256: b.sha256, size: b.size, storage_nodes: replicas });
+      const { chosen } = this.pickUpNodes(b.sha256);
+      rows.push({ idx: b.index, sha256: b.sha256, size: b.size, storage_nodes: chosen });
     }
 
     let file;
@@ -245,9 +362,8 @@ export class CoordinatorServer {
       return;
     }
     if (block.uploaded) {
-      // drain and ack
       for await (const _ of req) {
-        /* discard */
+        /* drain */
       }
       res.writeHead(200);
       res.end();
@@ -267,16 +383,22 @@ export class CoordinatorServer {
       return;
     }
 
-    const { successes, lastErr } = await this.fanoutPut(block.storage_nodes, block.sha256, body);
+    const { successes, lastErr } = await this.fanoutPut(
+      block.storage_nodes,
+      block.sha256,
+      body,
+    );
     if (successes === 0) {
       res.writeHead(502);
       res.end("all replicas failed: " + String(lastErr));
       return;
     }
     if (successes < block.storage_nodes.length) {
-      this.log(
-        `block ${block.sha256}: only ${successes}/${block.storage_nodes.length} replicas accepted`,
-      );
+      this.log.warn("partial_replica_write", {
+        block: block.sha256,
+        ok: successes,
+        want: block.storage_nodes.length,
+      });
     }
     this.store.markUploaded(file.id, idx);
     res.writeHead(200);
@@ -290,20 +412,31 @@ export class CoordinatorServer {
   ): Promise<{ successes: number; lastErr: unknown }> {
     let successes = 0;
     let lastErr: unknown = null;
+    const auth = bearerHeader(this.token);
     for (const node of nodes) {
+      if (!this.probe.isUp(node)) {
+        this.metrics.replicaWrites.inc("outcome", "skipped_down");
+        lastErr = `${node}: down (skipped)`;
+        continue;
+      }
       try {
+        const headers: Record<string, string> = { "Content-Type": "application/octet-stream" };
+        if (auth) headers["Authorization"] = auth;
         const r = await fetch(`${node}/blocks/${blockSha}`, {
           method: "PUT",
           body,
-          headers: { "Content-Type": "application/octet-stream" },
+          headers,
         });
         if (Math.floor(r.status / 100) !== 2) {
           lastErr = `${node}: ${r.status}`;
+          this.metrics.replicaWrites.inc("outcome", "failure");
           continue;
         }
         successes++;
+        this.metrics.replicaWrites.inc("outcome", "success");
       } catch (err) {
         lastErr = err;
+        this.metrics.replicaWrites.inc("outcome", "failure");
       }
     }
     return { successes, lastErr };
@@ -337,22 +470,30 @@ export class CoordinatorServer {
     res.end(buf);
   }
 
-  /** Fetch a block, trying replicas first, then any other node as fallback. */
+  /** Fetch a block from any replica (prefer healthy, then any). */
   private async fetchBlock(block: BlockRow): Promise<Buffer | null> {
     const tried = new Set<string>();
-    const candidates = [...block.storage_nodes];
+    const up: string[] = [];
+    const down: string[] = [];
+    for (const n of block.storage_nodes) {
+      (this.probe.isUp(n) ? up : down).push(n);
+    }
+    const candidates = [...up, ...down];
     for (const n of this.pickNodes(block.sha256)) {
       if (!candidates.includes(n)) candidates.push(n);
     }
+    const auth = bearerHeader(this.token);
     for (const node of candidates) {
       if (tried.has(node)) continue;
       tried.add(node);
       try {
-        const r = await fetch(`${node}/blocks/${block.sha256}`);
+        const headers: Record<string, string> = {};
+        if (auth) headers["Authorization"] = auth;
+        const r = await fetch(`${node}/blocks/${block.sha256}`, { headers });
         if (r.status !== 200) continue;
         return Buffer.from(await r.arrayBuffer());
       } catch {
-        /* try next */
+        /* next */
       }
     }
     return null;
@@ -418,7 +559,7 @@ export class CoordinatorServer {
     for (const b of blocks) {
       const buf = await this.fetchBlock(b);
       if (!buf) {
-        this.log(`download ${name}: block ${b.idx} unavailable`);
+        this.log.warn("download_stream", { file: name, idx: b.idx });
         res.destroy();
         return;
       }
@@ -437,10 +578,13 @@ export class CoordinatorServer {
       return;
     }
     const blocks = this.store.listBlocks(file.id);
+    const auth = bearerHeader(this.token);
     for (const b of blocks) {
       for (const node of b.storage_nodes) {
         try {
-          await fetch(`${node}/blocks/${b.sha256}`, { method: "DELETE" });
+          const headers: Record<string, string> = {};
+          if (auth) headers["Authorization"] = auth;
+          await fetch(`${node}/blocks/${b.sha256}`, { method: "DELETE", headers });
         } catch {
           /* best effort */
         }
@@ -459,6 +603,23 @@ export class CoordinatorServer {
     res.writeHead(204);
     res.end();
   }
+}
+
+function classifyRoute(p: string): string {
+  if (p === "/healthz") return "/healthz";
+  if (p === "/metrics") return "/metrics";
+  if (p === "/v1/files") return "/v1/files";
+  if (p.startsWith("/v1/files/")) {
+    const rest = p.slice("/v1/files/".length);
+    const parts = rest.split("/");
+    if (parts.length === 1) return "/v1/files/:name";
+    const sub = parts[1];
+    if (sub === "init" || sub === "commit" || sub === "manifest") {
+      return `/v1/files/:name/${sub}`;
+    }
+    if (sub === "blocks") return "/v1/files/:name/blocks/:idx";
+  }
+  return "other";
 }
 
 function methodNotAllowed(res: ServerResponse): void {
