@@ -1,0 +1,56 @@
+services:
+  storage1:
+    build:
+      context: .
+      dockerfile: Dockerfile.storage
+    command: ["-addr", ":9982", "-data", "/data", "-id", "node-1"]
+    volumes:
+      - storage1-data:/data
+    ports:
+      - "9982:9982"
+
+  storage2:
+    build:
+      context: .
+      dockerfile: Dockerfile.storage
+    command: ["-addr", ":9983", "-data", "/data", "-id", "node-2"]
+    volumes:
+      - storage2-data:/data
+    ports:
+      - "9983:9983"
+
+  storage3:
+    build:
+      context: .
+      dockerfile: Dockerfile.storage
+    command: ["-addr", ":9984", "-data", "/data", "-id", "node-3"]
+    volumes:
+      - storage3-data:/data
+    ports:
+      - "9984:9984"
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    command:
+      - "-addr=:9981"
+      - "-db=/data/coordinator.db"
+      - "-nodes=http://storage1:9982,http://storage2:9983,http://storage3:9984"
+      - "-replicas=1"
+    environment:
+      MINIDSS_REPLICAS: "1"
+    volumes:
+      - coordinator-data:/data
+    ports:
+      - "9981:9981"
+    depends_on:
+      - storage1
+      - storage2
+      - storage3
+
+volumes:
+  storage1-data: {}
+  storage2-data: {}
+  storage3-data: {}
+  coordinator-data: {}
